@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from torch.autograd import Variable
+from random import shuffle
 import os
 
 from typing import List
@@ -18,10 +19,10 @@ class LSTMState(BeamState):
 class SpecialTrainer(torch.nn.Module):
     def __init__(self, pid_pmap, retrieved_pids, ordinal_map, ndarray, page_key_map, page_context_ndarray):
         super(SpecialTrainer, self).__init__()
-        self.hidden_size = 100
+        self.hidden_size = 100 * 2
         self.n_paragraphs = 100
         self.n_features = 1024
-        self.n_context_hidden = 4
+        self.n_context_hidden = 1
         self.n_seq_hidden = 1
 
         self.pid_map = pid_pmap
@@ -37,6 +38,7 @@ class SpecialTrainer(torch.nn.Module):
         self.bm25_maps = []
         self.predicted_maps = []
         # torch.nn.LSTM()
+        self.dropout = torch.nn.Dropout(0.0)
 
 
         self.passage_context_lstm = torch.nn.LSTM(
@@ -44,7 +46,8 @@ class SpecialTrainer(torch.nn.Module):
             hidden_size=self.hidden_size,
             num_layers=self.n_context_hidden,
             batch_first=True,
-            bidirectional=True
+            bidirectional=True,
+            dropout=0.0
         )
 
         self.sequence_generator = torch.nn.LSTM(
@@ -58,11 +61,18 @@ class SpecialTrainer(torch.nn.Module):
         # self.state_map = torch.nn.Linear(self.hidden_size, self.hidden_size * self.hidden_size)
         # self.page_context_map = torch.nn.Linear(self.n_features * 3, self.hidden_size * self.hidden_size)
 
+        # self.reset_lever = torch.nn.Linear(self.hidden_size * 2, 1)
+        # self.reset_lever2 = torch.nn.Linear(self.hidden_size * 2, 1)
+        self.reset_lever = torch.nn.Linear(self.n_features * 3, 400)
+        self.reset_lever2 = torch.nn.Linear(self.hidden_size * 2, self.hidden_size * 2)
+
+
         self.state_map = torch.nn.Linear(self.hidden_size * 2, self.hidden_size * 2)
         self.page_context_map = torch.nn.Linear(self.n_features * 3, self.hidden_size * 2)
+        self.context_converter = torch.nn.Linear(self.n_context_hidden * 2, 1)
 
         self.attention_weights = torch.nn.Linear(self.hidden_size * 2, 1)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.00004)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.0004)
 
 
     def get_map(self, rankings, relevants):
@@ -77,6 +87,8 @@ class SpecialTrainer(torch.nn.Module):
         return total / len(relevants)
 
     def do_train(self, **kwargs):
+        prevs = []
+        counter = 0
         for _ in range(1):
             for query in sorted(self.ordinal_map.keys()):
                 retrieved = self.retrieved_pids[query]
@@ -86,14 +98,17 @@ class SpecialTrainer(torch.nn.Module):
                 if n_count <= 0 or has_nan:
                     continue
 
+                prevs.append(query)
+
                 print("{}: {}".format(query, n_count))
                 ordinals = self.ordinal_map[query]
                 relevant = set([i for i in retrieved if i in ordinals])
                 map = self.get_map(retrieved, relevant)
                 self.bm25_maps.append(map)
-                if len(self.bm25_maps) > 10:
-                    self.bm25_maps = self.bm25_maps[1:]
+                # if len(self.bm25_maps) > 10:
+                #     self.bm25_maps = self.bm25_maps[1:]
                 print("Original MAP: {}".format(map))
+                counter += 1
 
                 for i in range(5):
                     self.optimizer.zero_grad()
@@ -103,9 +118,21 @@ class SpecialTrainer(torch.nn.Module):
                     self.optimizer.step()
 
 
+
                 av1 = sum(self.bm25_maps) / len(self.bm25_maps)
                 av2 = sum(self.predicted_maps) / len(self.predicted_maps)
                 print("{} / {}".format(av1, av2))
+
+                if counter > 20:
+                    print("Starting prev training")
+                    shuffle(prevs)
+                    for prev in prevs[0:5]:
+                        self.optimizer.zero_grad()
+                        loss = self.forward(prev, first=False)
+                        # print(loss)
+                        loss.backward()
+                        self.optimizer.step()
+
 
 
 
@@ -121,17 +148,25 @@ class SpecialTrainer(torch.nn.Module):
 
 
 
-    def run_transform(self, state, mean_context, page_vector=None):
+    def run_transform(self, state, mean_context, page_vector=None, seen=None):
         # transform_matrix = self.state_map(state).reshape((self.hidden_size, self.hidden_size))
         # context_matrix = self.page_context_map(page_vector).reshape((self.hidden_size, self.hidden_size))
         # result = mean_context @ (self.tanh(transform_matrix) * self.tanh(context_matrix))
 
-        transform_matrix = self.state_map(state)
-        context_matrix = self.page_context_map(page_vector)
+        s1 = self.dropout(state)
+        s2 = self.dropout(page_vector)
+        # transform_matrix = self.state_map(state)
+        transform_matrix = self.state_map(s1)
+        # context_matrix = self.page_context_map(page_vector)
+        context_matrix = self.page_context_map(s2)
         result = mean_context * (self.tanh(transform_matrix)) * (self.tanh(context_matrix))
 
         result = self.attention_weights(result).squeeze()
         # result = self.softmax(result).detach().numpy()
+        mask = torch.ones(result.shape)
+        for s in seen:
+            mask[s] = 0
+        result = result * mask
         result = self.softmax(result)
         sorted_args = torch.argsort(result, 0, descending=True)
         return sorted_args, result
@@ -145,7 +180,7 @@ class SpecialTrainer(torch.nn.Module):
         result = self.softmax(result)
         return result
 
-    def get_initial_state(self, ret_mat):
+    def get_initial_state(self, ret_mat, page_vector):
         context_out, (hidden, state) = self.passage_context_lstm(ret_mat)
         # hidden = torch.cat([hidden[0], hidden[1]], 0)
         # state = torch.cat([state[0], state[1]], 0)
@@ -153,12 +188,19 @@ class SpecialTrainer(torch.nn.Module):
         chosen = context_out.mean(0).unsqueeze(0)
         cmean = context_out.mean(1)
 
+        # hmean = self.context_converter(hidden.permute(2, 1, 0))
+        # smean = self.context_converter(state.permute(2, 1, 0))
+
         hmean = hidden.mean(1).unsqueeze(1)
         smean = state.mean(1).unsqueeze(1)
+
         # hmean = hidden.mean(1).unsqueeze(0)[:, -1, :].unsqueeze(0)
         # smean = state.mean(1).unsqueeze(0)[:, -1, :].unsqueeze(0)
+
         hmean = torch.cat([hmean[0], hmean[1]], 1).unsqueeze(0)
         smean = torch.cat([smean[0], smean[1]], 1).unsqueeze(0)
+
+
         # print(hmean.shape)
         # print(hidden.shape)
 
@@ -166,14 +208,14 @@ class SpecialTrainer(torch.nn.Module):
         return cmean, context_out, seq_out, hidden, state
 
     def run_prediction_step(self, state, mean_context, seen, page_vector):
-        sorted_args, values = self.run_transform(state, mean_context, page_vector)
+        sorted_args, values = self.run_transform(state, mean_context, page_vector, seen)
         for (arg, value)  in zip(sorted_args, values):
             arg = int(arg)
             if arg not in seen:
                 seen.add(arg)
-                return arg, values
+                return arg, values, sorted_args
 
-        return [None, None]
+        return [None, None, sorted_args]
 
 
     def create_beam_choice_function(self, mean_context):
@@ -276,59 +318,26 @@ class SpecialTrainer(torch.nn.Module):
         page_vector = page_vector.unsqueeze(0)
         ret_mat = Variable(ret_mat)
 
-        cmean, context_out, seq_out, hidden, state = self.get_initial_state(ret_mat)
+        cmean, context_out, seq_out, hidden, state = self.get_initial_state(ret_mat, page_vector)
+        inside = len([i for i in retrieved if i in ordinals])
 
-        # wee = self.attention_weights(cmean)
-        # wee = self.sigmoid(wee)
-        # labels = []
-        # for i in retrieved:
-        #     if i in ordinals:
-        #         labels.append(1.0)
-        #     else:
-        #         labels.append(0.0)
-        # labels = torch.Tensor(labels)
-        # loss = self.loss(wee, labels)
-        # return loss
-
-        # out, (hidden, state) = self.passage_context_lstm(ret_mat)
-        # chosen = out.mean(0).unsqueeze(0)
-        # cmean = out.mean(1)
-        # hmean = hidden.mean(1).unsqueeze(0)
-        # smean = state.mean(1).unsqueeze(0)
-        # out2, (hidden, state) = self.sequence_generator(chosen, (hmean, smean))
-
-
-        # out, (hidden, state) = self.sequence_generator(out, (hidden, state))
 
 
 
         args = []
         values = None
-        # while True:
-        #
-        #     # Predict
-        #     arg, value = self.run_prediction_step(state, cmean, seen)
-        #     if arg is None:
-        #         break
-        #
-        #     # Update results
-        #     args.append(arg)
-        #     if values is None:
-        #         values = value.reshape((1))
-        #     else:
-        #         values = torch.cat([values, value.reshape((1))], 0)
-        #     # values.append(value)
-        #
-        #     # Transform input for next state based on choice
-        #     # seq_out = torch.cat([seq_out, context_out[arg].unsqueeze(0)], 1)
-        #     seq_out, (hidden, state) = self.sequence_generator(seq_out, (hidden, state))
 
 
         counter = 0
         while True:
 
             # Predict
-            arg, vals = self.run_prediction_step(state, cmean, seen, page_vector)
+            arg, vals, sorted_args = self.run_prediction_step(state, cmean, seen, page_vector)
+
+            # args = list(sorted_args.detach().numpy())
+            # values = vals
+            # values = values[sorted_args]
+            # break
 
             if arg is None:
                 break
@@ -349,9 +358,27 @@ class SpecialTrainer(torch.nn.Module):
             # seq_out = torch.cat([seq_out, context_out[arg].unsqueeze(0).mean(1).unsqueeze(0)], 1)
 
             counter += 1
+            # if counter >= 20:
+            #     break
 
             # seq_out = torch.cat([seq_out[:, 0:(4 + counter), :], context_out[arg].unsqueeze(0)], 1)
-            # seq_out = torch.cat([seq_out, context_out[arg].unsqueeze(0)], 1)
+
+
+            seq_out = torch.cat([seq_out, context_out[arg].unsqueeze(0)], 1)
+            reset_page = self.tanh(self.reset_lever(page_vector))
+            reset_context = self.tanh(self.reset_lever2(context_out[arg]))
+            # print(reset_context.shape)
+            reset_context = reset_context.mean(0).unsqueeze(0)
+
+            reset_score = self.sigmoid((reset_page * reset_context).sum())
+
+            # reset_score = self.sigmoid(self.reset_lever(hidden).sum())
+            # reset_score2 = self.sigmoid(self.reset_lever2(state).sum())
+
+            # if reset_score * reset_score2 <= 0.9:
+            if reset_score <= 0.95:
+                seq_out = seq_out.mean(1).unsqueeze(0)
+                # seq_out = seq_out[:, 0:4, :]
             # seq_out = torch.cat([seq_out[:, 0:4, :], context_out[arg].unsqueeze(0)], 1)
 
             # seq_out = (seq_out + context_out[arg].unsqueeze(0)) / 2.0
@@ -364,8 +391,16 @@ class SpecialTrainer(torch.nn.Module):
         # prod_val = torch.nn.Sigmoid()(torch.log(torch.Tensor(values)).cumsum(0))
         # prod_val = values.cumprod(0)
         # prod_val = values
+        others = list(range(len(retrieved) - counter))
+        shuffle(others)
+        for i in others:
+            values = torch.cat([values, torch.Tensor([0.0])], 0)
 
         out = ""
+        other_args = list(range(len(retrieved)))
+        for i in other_args:
+            if i not in args:
+                args.append(i)
         for arg in args:
             pid = retrieved[arg]
             if pid in ordinals:
@@ -373,7 +408,8 @@ class SpecialTrainer(torch.nn.Module):
             else:
                 out += " ."
 
-        values = values / torch.Tensor(np.asarray([(i + 1) **2 for i in range(len(values))]))
+        # values = values / torch.Tensor(np.asarray([(i + 1) **2 for i in range(len(values))]))
+        values = values / torch.Tensor(np.asarray([(i + 1) ** 2.0 for i in range(len(values))]))
         # prod_val = (torch.Tensor(values)).cumprod(0)
         # prod_val = (torch.Tensor(values)).cumprod(0)
         prod_val = (torch.Tensor(values))
@@ -385,8 +421,8 @@ class SpecialTrainer(torch.nn.Module):
         map = self.get_map(rankings, relevants)
         if first:
             self.predicted_maps.append(map)
-            if len(self.predicted_maps) > 10:
-                self.predicted_maps = self.predicted_maps[1:]
+            # if len(self.predicted_maps) > 10:
+            #     self.predicted_maps = self.predicted_maps[1:]
 
         loss = self.loss(prod_val, labels)
         # print(out + "     [{}]".format(float(loss)))

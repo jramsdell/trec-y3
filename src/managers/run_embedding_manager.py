@@ -11,15 +11,25 @@ import numpy as np
 
 
 class RunEmbeddingManager(object):
-    def __init__(self, page_loc, run_loc, json_loc, json_pmap_loc):
+    def __init__(self, page_loc, run_loc, json_loc, json_pmap_loc, y1_test_page_loc, y1_test_run_loc, y2_test_run_loc,
+                 y3_train_run_loc, y3_test_run_loc):
         self.json_reader = JSONLParagraphReader(json_loc, json_pmap_loc)
         self.pid_retriever = RunPidRetriever(run_loc, max_depth=100)
+        self.y1_test_pid_retriever = RunPidRetriever(y1_test_run_loc, max_depth=100)
+        self.y2_test_pid_retriever = RunPidRetriever(y2_test_run_loc, max_depth=100)
+        self.y3_train_pid_retriever = RunPidRetriever(y3_train_run_loc, max_depth=100)
+        self.y3_test_pid_retriever = RunPidRetriever(y3_test_run_loc, max_depth=100)
         self.outline_reader = OutlineReader(page_loc)
+        self.y1_test_outline_reader = OutlineReader(y1_test_page_loc)
         self.tokenizer = SentenceTokenizer()
 
     def run_embedding(self):
         embedder = ElmoVectorEmbedderRunner()
         pids = self.pid_retriever.get_unique_pids()
+        pids = pids.union(self.y1_test_pid_retriever.get_unique_pids())
+        pids = pids.union(self.y2_test_pid_retriever.get_unique_pids())
+        pids = pids.union(self.y3_train_pid_retriever.get_unique_pids())
+        pids = pids.union(self.y3_test_pid_retriever.get_unique_pids())
 
         keys = []
         texts = []
@@ -33,8 +43,8 @@ class RunEmbeddingManager(object):
         texts = self.tokenizer.tokenize_documents(texts)
         embedded = embedder.map_function(texts)
 
-        np.save("new_wubba.npy", np.asarray(embedded))
-        with open("new_key_map.txt", "w") as f:
+        np.save("new_wubba2.npy", np.asarray(embedded))
+        with open("new_key_map2.txt", "w") as f:
             f.write("\n".join(keys))
 
     def run_page_embedding(self):
@@ -104,20 +114,30 @@ class RunEmbeddingManager(object):
 
 
 if __name__ == '__main__':
-    torch.set_num_threads(1)
+    torch.set_num_threads(30)
     jsonl_loc = "/home/jsc57/projects/context_summarization/y1_corpus.jsonl"
     pmap_loc = "/home/jsc57/projects/context_summarization/y1_corpus_pmap.txt"
     page_loc = "/home/jsc57/data/benchmark/benchmarkY1/benchmarkY1-train/train.pages.cbor"
+    y1_test_page_loc = "/home/jsc57/data/benchmark/test/benchmarkY1/benchmarkY1-test/test.pages.cbor"
     # run_loc = "/mnt/grapes/share/car-input-runs/benchmarkY1train-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--all-bm25-none--Text-english-k1000-20_20_20-benchmarkY1train.v201.cbor.outlines.run"
     run_loc = "/mnt/grapes/share/car-input-runs/benchmarkY1train-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--title-bm25-none--Text-english-k1000-20_100_20-benchmarkY1train.v201.cbor.outlines.run"
+    y1_test_loc = "/mnt/grapes/share/car-input-runs/benchmarkY1test-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--title-bm25-none--Text-english-k1000-20_100_20-benchmarkY1test.v201.cbor.outlines.run"
+    y2_test_loc = "/mnt/grapes/share/car-input-runs/benchmarkY2test-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--title-bm25-none--Text-english-k1000-20_100_20-benchmarkY2test.v201.cbor.outlines.run"
+    y3_train_loc = "/mnt/grapes/share/car-input-runs/benchmarkY3train-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--title-bm25-none--Text-english-k1000-20_100_20-benchmarkY3train.v201.cbor.outlines.run"
+    y3_test_loc = "/mnt/grapes/share/car-input-runs/benchmarkY3test-lucene-runs-14-page/lucene-luceneindexlucene-v21-14-lucene-paragraph--paragraph-page--title-bm25-none--Text-english-k1000-20_100_20-benchmarkY3test.v201.cbor.outlines.run"
 
     manager = RunEmbeddingManager(
         page_loc=page_loc,
         run_loc=run_loc,
+        y1_test_run_loc=y1_test_loc,
+        y1_test_page_loc=y1_test_page_loc,
+        y2_test_run_loc=y2_test_loc,
+        y3_train_run_loc=y3_train_loc,
+        y3_test_run_loc=y3_test_loc,
         json_loc=jsonl_loc,
         json_pmap_loc=pmap_loc
     )
 
-    # manager.run_embedding()
+    manager.run_embedding()
     # manager.run_page_embedding()
-    manager.run_training_construction()
+    # manager.run_training_construction()
